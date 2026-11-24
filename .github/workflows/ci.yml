@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev,serve,gcp]"
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Fetch dataset
+        run: ./scripts/download_data.sh
+
+      - name: Tests
+        run: pytest --cov=churn --cov-report=term-missing
+
+      - name: Compile pipeline
+        run: python -m pipelines.churn_pipeline --compile-only
+
+      - name: Build serving image
+        run: docker build -f docker/serving.Dockerfile -t churn-serving:ci .

@@ -1,0 +1,72 @@
+# Shared config for local runs, the Vertex pipeline and the serving container.
+# Anything GCP-specific can be overridden with env vars (see churn/config.py).
+
+gcp:
+  project: ${GCP_PROJECT}
+  region: us-central1
+  bq_dataset: churn
+  raw_table: telco_customers_raw
+  feature_view: telco_customers_features
+  prediction_log_table: prediction_log
+  pipeline_root: gs://${GCP_PROJECT}-churn/pipeline-root
+  model_display_name: telco-churn-xgb
+
+data:
+  id_column: customer_id
+  label_column: churned
+  test_size: 0.2
+  random_state: 42
+
+features:
+  numeric:
+    - tenure
+    - monthly_charges
+    - total_charges
+    - avg_monthly_spend
+    - num_addon_services
+  categorical:
+    - gender
+    - senior_citizen
+    - partner
+    - dependents
+    - phone_service
+    - multiple_lines
+    - internet_service
+    - online_security
+    - online_backup
+    - device_protection
+    - tech_support
+    - streaming_tv
+    - streaming_movies
+    - contract
+    - paperless_billing
+    - payment_method
+    - tenure_bucket
+
+model:
+  n_estimators: 400
+  max_depth: 4
+  learning_rate: 0.05
+  subsample: 0.85
+  colsample_bytree: 0.8
+  min_child_weight: 3
+  reg_lambda: 1.0
+  early_stopping_rounds: 30
+
+# Promotion gate. A candidate is only registered if it clears all of these,
+# and it must not regress more than `max_auc_regression` against the current champion.
+evaluation:
+  min_roc_auc: 0.82
+  min_pr_auc: 0.60
+  min_recall_at_threshold: 0.70
+  max_auc_regression: 0.01
+  decision_threshold: 0.55  # best F1 on holdout; scale_pos_weight shifts probabilities up
+
+monitoring:
+  # Jensen-Shannon for numeric, L-infinity for categorical (Vertex defaults).
+  numeric_drift_threshold: 0.15
+  categorical_drift_threshold: 0.20
+  prediction_drift_threshold: 0.10
+  schedule_cron: "0 6 * * *"
+  window: 24h
+  alert_emails: []

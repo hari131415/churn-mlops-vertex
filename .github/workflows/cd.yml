@@ -1,0 +1,142 @@
+name: cd
+
+# Train -> gate -> deploy. Manual trigger only (Actions tab -> cd -> Run workflow);
+# retraining on every merge burns money for no reason.
+on:
+  workflow_dispatch:
+    inputs:
+      skip_training:
+        description: "Redeploy current champion without retraining"
+        type: boolean
+        default: false
+
+env:
+  REGION: us-central1
+  REPO: churn
+  SERVICE: churn-service
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    outputs:
+      pipeline_image: ${{ steps.tags.outputs.pipeline }}
+      serving_image: ${{ steps.tags.outputs.serving }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - id: tags
+        run: |
+          base="${REGION}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${REPO}"
+          echo "pipeline=${base}/pipeline:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "serving=${base}/serving:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        run: |
+          gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+          docker build -f docker/pipeline.Dockerfile -t ${{ steps.tags.outputs.pipeline }} .
+          docker build -f docker/serving.Dockerfile  -t ${{ steps.tags.outputs.serving }} .
+          docker push ${{ steps.tags.outputs.pipeline }}
+          docker push ${{ steps.tags.outputs.serving }}
+
+  train:
+    needs: build-images
+    if: ${{ !inputs.skip_training }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      registered: ${{ steps.check.outputs.registered }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[gcp]"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.DEPLOY_SA }}
+
+      - name: Run Vertex pipeline
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          PIPELINE_IMAGE: ${{ needs.build-images.outputs.pipeline_image }}
+        run: |
+          python -m pipelines.churn_pipeline \
+            --project "$GCP_PROJECT" \
+            --git-sha "$GITHUB_SHA" \
+            --service-account "${{ secrets.PIPELINE_SA }}" \
+            --wait
+
+      - name: Did the gate pass?
+        id: check
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: python scripts/latest_challenger.py >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [build-images, train]
+    # Deploy when training registered a new challenger, or when explicitly
+    # redeploying the current champion.
+    if: ${{ always() && (needs.train.outputs.registered == 'true' || inputs.skip_training) }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[gcp]"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve model artifact
+        id: model
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: |
+          alias=${{ needs.train.outputs.registered == 'true' && 'challenger' || 'champion' }}
+          echo "uri=$(python scripts/model_uri.py --alias $alias)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy with no traffic
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --image "${{ needs.build-images.outputs.serving_image }}" \
+            --region "$REGION" \
+            --no-traffic --tag candidate \
+            --set-env-vars "MODEL_URI=${{ steps.model.outputs.uri }},PREDICTION_LOG_TABLE=${{ secrets.GCP_PROJECT }}.churn.prediction_log" \
+            --cpu 1 --memory 1Gi --concurrency 40 --min-instances 1 --max-instances 10 \
+            --service-account "${{ secrets.SERVING_SA }}"
+
+      - name: Smoke test candidate
+        run: |
+          url=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+                --format 'value(status.traffic[?tag=candidate].url)' | head -1)
+          ./scripts/smoke_test.sh "$url"
+
+      - name: Shift traffic
+        run: gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-tags candidate=100
+
+      - name: Promote challenger to champion
+        if: needs.train.outputs.registered == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: python scripts/promote.py --version "${{ needs.train.outputs.version }}"
